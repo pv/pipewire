@@ -67,6 +67,7 @@ static int codec_order(const struct a2dp_codec *c)
 		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_51,
 		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_71,
 		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX,
+		SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO,
 	};
 	size_t i;
 	for (i = 0; i < SPA_N_ELEMENTS(order); ++i)

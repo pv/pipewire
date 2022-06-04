@@ -24,6 +24,7 @@
  */
 
 #include <unistd.h>
+#include <string.h>
 #include <stddef.h>
 #include <errno.h>
 #include <arpa/inet.h>
@@ -31,7 +32,11 @@
 #include <byteswap.h>
 #endif
 
+#include <spa/debug/types.h>
+#include <spa/param/audio/type-info.h>
 #include <spa/param/audio/raw.h>
+#include <spa/utils/string.h>
+#include <spa/utils/dict.h>
 #include <spa/param/audio/format.h>
 #include <spa/param/audio/format-utils.h>
 
@@ -56,6 +61,22 @@ static struct spa_log_topic log_topic = SPA_LOG_TOPIC(0, "spa.bluez5.codecs.opus
 #define BITRATE_DUPLEX_BIDI		160000
 
 #define OPUS_05_MAX_BYTES	(15 * 1024)
+
+struct props {
+	uint32_t channels;
+	uint32_t coupled_streams;
+	uint32_t location;
+	uint32_t max_bitrate;
+	uint8_t frame_duration;
+	int application;
+
+	uint32_t bidi_channels;
+	uint32_t bidi_coupled_streams;
+	uint32_t bidi_location;
+	uint32_t bidi_max_bitrate;
+	uint32_t bidi_frame_duration;
+	int bidi_application;
+};
 
 struct dec_data {
 	int fragment_size;
@@ -226,7 +247,133 @@ static const struct surround_encoder_mapping surround_encoders[] = {
 	  { 0, 6, 1, 2, 3, 4, 5, 7 }, { 0, 2, 3, 4, 5, 6, 1, 7 } },
 };
 
-static int set_channel_conf(const struct a2dp_codec *codec, a2dp_opus_05_t *caps)
+static uint32_t bt_channel_from_name(const char *name)
+{
+	size_t i;
+	enum spa_audio_channel position = SPA_AUDIO_CHANNEL_UNKNOWN;
+
+	for (i = 0; spa_type_audio_channel[i].name; i++) {
+		if (spa_streq(name, spa_debug_type_short_name(spa_type_audio_channel[i].name))) {
+			position = spa_type_audio_channel[i].type;
+			break;
+		}
+	}
+	for (i = 0; i < SPA_N_ELEMENTS(audio_locations); i++) {
+		if (position == audio_locations[i].position)
+			return audio_locations[i].mask;
+	}
+	return 0;
+}
+
+static uint32_t parse_locations(const char *str)
+{
+	char *s, *p, *save = NULL;
+	uint32_t location = 0;
+
+	if (!str)
+		return 0;
+
+	s = strdup(str);
+	if (s == NULL)
+		return 0;
+
+	for (p = s; (p = strtok_r(p, ", ", &save)) != NULL; p = NULL) {
+		if (*p == '\0')
+			continue;
+		location |= bt_channel_from_name(p);
+	}
+	free(s);
+
+	return location;
+}
+
+static void parse_settings(struct props *props, const struct spa_dict *settings)
+{
+	const char *str;
+	uint32_t v;
+
+	/* Pro Audio settings */
+	spa_zero(*props);
+	props->channels = 8;
+	props->coupled_streams = 0;
+	props->location = 0;
+	props->max_bitrate = BITRATE_MAX;
+	props->frame_duration = OPUS_05_FRAME_DURATION_100;
+	props->application = OPUS_APPLICATION_AUDIO;
+
+	props->bidi_channels = 1;
+	props->bidi_coupled_streams = 0;
+	props->bidi_location = 0;
+	props->bidi_max_bitrate = BITRATE_DUPLEX_BIDI;
+	props->bidi_frame_duration = OPUS_05_FRAME_DURATION_400;
+	props->bidi_application = OPUS_APPLICATION_AUDIO;
+
+	if (settings == NULL)
+		return;
+
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.channels"), &v, 0))
+		props->channels = SPA_CLAMP(v, 1u, SPA_AUDIO_MAX_CHANNELS);
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.max-bitrate"), &v, 0))
+		props->max_bitrate = SPA_MAX(v, (uint32_t)BITRATE_MIN);
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.coupled-streams"), &v, 0))
+		props->coupled_streams = SPA_CLAMP(v, 0u, props->channels / 2);
+
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.channels"), &v, 0))
+		props->bidi_channels = SPA_CLAMP(v, 0u, SPA_AUDIO_MAX_CHANNELS);
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.max-bitrate"), &v, 0))
+		props->bidi_max_bitrate = SPA_MAX(v, (uint32_t)BITRATE_MIN);
+	if (spa_atou32(spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.coupled-streams"), &v, 0))
+		props->bidi_coupled_streams = SPA_CLAMP(v, 0u, props->bidi_channels / 2);
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.locations");
+	props->location = parse_locations(str);
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.locations");
+	props->bidi_location = parse_locations(str);
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.frame-dms");
+	if (spa_streq(str, "25"))
+		props->frame_duration = OPUS_05_FRAME_DURATION_25;
+	else if (spa_streq(str, "50"))
+		props->frame_duration = OPUS_05_FRAME_DURATION_50;
+	else if (spa_streq(str, "100"))
+		props->frame_duration = OPUS_05_FRAME_DURATION_100;
+	else if (spa_streq(str, "200"))
+		props->frame_duration = OPUS_05_FRAME_DURATION_200;
+	else if (spa_streq(str, "400"))
+		props->frame_duration = OPUS_05_FRAME_DURATION_400;
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.frame-dms");
+	if (spa_streq(str, "25"))
+		props->bidi_frame_duration = OPUS_05_FRAME_DURATION_25;
+	else if (spa_streq(str, "50"))
+		props->bidi_frame_duration = OPUS_05_FRAME_DURATION_50;
+	else if (spa_streq(str, "100"))
+		props->bidi_frame_duration = OPUS_05_FRAME_DURATION_100;
+	else if (spa_streq(str, "200"))
+		props->bidi_frame_duration = OPUS_05_FRAME_DURATION_200;
+	else if (spa_streq(str, "400"))
+		props->bidi_frame_duration = OPUS_05_FRAME_DURATION_400;
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.application");
+	if (spa_streq(str, "audio"))
+		props->application = OPUS_APPLICATION_AUDIO;
+	else if (spa_streq(str, "voip"))
+		props->application = OPUS_APPLICATION_VOIP;
+	else if (spa_streq(str, "lowdelay"))
+		props->application = OPUS_APPLICATION_RESTRICTED_LOWDELAY;
+
+
+	str = spa_dict_lookup(settings, "bluez5.a2dp.opus.pro.bidi.application");
+	if (spa_streq(str, "audio"))
+		props->bidi_application = OPUS_APPLICATION_AUDIO;
+	else if (spa_streq(str, "voip"))
+		props->bidi_application = OPUS_APPLICATION_VOIP;
+	else if (spa_streq(str, "lowdelay"))
+		props->bidi_application = OPUS_APPLICATION_RESTRICTED_LOWDELAY;
+}
+
+static int set_channel_conf(const struct a2dp_codec *codec, a2dp_opus_05_t *caps, const struct props *props)
 {
 	/*
 	 * Predefined codec profiles
@@ -277,6 +424,20 @@ static int set_channel_conf(const struct a2dp_codec *codec, a2dp_opus_05_t *caps
 			caps->bidi.coupled_streams = surround_encoders[1].coupled_streams;
 			OPUS_05_SET_LOCATION(caps->bidi, surround_encoders[1].location);
 		}
+		break;
+	case SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO:
+		if (caps->main.channels < props->channels)
+			return -EINVAL;
+		if (props->bidi_channels == 0 && caps->bidi.channels != 0)
+			return -EINVAL;
+		if (caps->bidi.channels < props->bidi_channels)
+			return -EINVAL;
+		caps->main.channels = props->channels;
+		caps->main.coupled_streams = props->coupled_streams;
+		OPUS_05_SET_LOCATION(caps->main, props->location);
+		caps->bidi.channels = props->bidi_channels;
+		caps->bidi.coupled_streams = props->bidi_coupled_streams;
+		OPUS_05_SET_LOCATION(caps->bidi, props->bidi_location);
 		break;
 	default:
 		spa_assert(false);
@@ -373,9 +534,10 @@ static int codec_fill_caps(const struct a2dp_codec *codec, uint32_t flags,
 		}
 	};
 
-	/* Only duplex codec has bidi, since bluez5-device has to know early
+	/* Only duplex/pro codec has bidi, since bluez5-device has to know early
 	 * whether to show nodes or not. */
-	if (codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX)
+	if (codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX &&
+			codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO)
 		spa_zero(a2dp_opus_05.bidi);
 
 	memcpy(caps, &a2dp_opus_05, sizeof(a2dp_opus_05));
@@ -388,6 +550,7 @@ static int codec_select_config(const struct a2dp_codec *codec, uint32_t flags,
 		const struct spa_dict *global_settings, uint8_t config[A2DP_MAX_CAPS_SIZE])
 {
 	bool duplex = (codec->id == SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_DUPLEX);
+	struct props props;
 	a2dp_opus_05_t conf;
 	int res;
 	int max;
@@ -401,45 +564,73 @@ static int codec_select_config(const struct a2dp_codec *codec, uint32_t flags,
 	    codec->vendor.codec_id != conf.info.codec_id)
 		return -ENOTSUP;
 
+	parse_settings(&props, global_settings);
+
 	/* Channel Configuration & Audio Location */
-	if ((res = set_channel_conf(codec, &conf)) < 0)
+	if ((res = set_channel_conf(codec, &conf, &props)) < 0)
 		return res;
 
 	/* Limits */
-	if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_100)
-		conf.main.frame_duration = OPUS_05_FRAME_DURATION_100;
-	else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_200)
-		conf.main.frame_duration = OPUS_05_FRAME_DURATION_200;
-	else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_400)
-		conf.main.frame_duration = OPUS_05_FRAME_DURATION_400;
-	else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_50)
-		conf.main.frame_duration = OPUS_05_FRAME_DURATION_50;
-	else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_25)
-		conf.main.frame_duration = OPUS_05_FRAME_DURATION_25;
-	else
-		return -EINVAL;
+	if (codec->id == SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO) {
+		max = props.max_bitrate;
+		if (OPUS_05_GET_BITRATE(conf.main) != 0)
+			OPUS_05_SET_BITRATE(conf.main, SPA_MIN(OPUS_05_GET_BITRATE(conf.main), max / 1024));
+		else
+			OPUS_05_SET_BITRATE(conf.main, max / 1024);
 
-	max = duplex ? BITRATE_DUPLEX_MAX : BITRATE_MAX;
+		max = props.bidi_max_bitrate;
+		if (OPUS_05_GET_BITRATE(conf.bidi) != 0)
+			OPUS_05_SET_BITRATE(conf.bidi, SPA_MIN(OPUS_05_GET_BITRATE(conf.bidi), max / 1024));
+		else
+			OPUS_05_SET_BITRATE(conf.bidi, max / 1024);
 
-	if (OPUS_05_GET_BITRATE(conf.main) != 0)
-		OPUS_05_SET_BITRATE(conf.main, SPA_MIN(OPUS_05_GET_BITRATE(conf.main), max / 1024));
-	else
-		OPUS_05_SET_BITRATE(conf.main, max / 1024);
+		if (conf.main.frame_duration & props.frame_duration)
+			conf.main.frame_duration = props.frame_duration;
+		else
+			return -EINVAL;
 
-	/* only 40 ms bidi frame appears to work OK */
-	if (conf.bidi.channels == 0)
-		true;
-	else if (conf.bidi.frame_duration & OPUS_05_FRAME_DURATION_400)
-		conf.bidi.frame_duration = OPUS_05_FRAME_DURATION_400;
-	else
-		return -EINVAL;
+		if (conf.bidi.channels == 0)
+			true;
+		else if (conf.bidi.frame_duration & props.bidi_frame_duration)
+			conf.bidi.frame_duration = props.bidi_frame_duration;
+		else
+			return -EINVAL;
+	} else {
+		if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_100)
+			conf.main.frame_duration = OPUS_05_FRAME_DURATION_100;
+		else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_200)
+			conf.main.frame_duration = OPUS_05_FRAME_DURATION_200;
+		else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_400)
+			conf.main.frame_duration = OPUS_05_FRAME_DURATION_400;
+		else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_50)
+			conf.main.frame_duration = OPUS_05_FRAME_DURATION_50;
+		else if (conf.main.frame_duration & OPUS_05_FRAME_DURATION_25)
+			conf.main.frame_duration = OPUS_05_FRAME_DURATION_25;
+		else
+			return -EINVAL;
 
-	if (conf.bidi.channels == 0)
-		true;
-	else if (OPUS_05_GET_BITRATE(conf.bidi) != 0)
-		OPUS_05_SET_BITRATE(conf.bidi, SPA_MIN(OPUS_05_GET_BITRATE(conf.bidi), BITRATE_DUPLEX_BIDI / 1024));
-	else
-		OPUS_05_SET_BITRATE(conf.bidi, BITRATE_DUPLEX_BIDI / 1024);
+		max = duplex ? BITRATE_DUPLEX_MAX : BITRATE_MAX;
+
+		if (OPUS_05_GET_BITRATE(conf.main) != 0)
+			OPUS_05_SET_BITRATE(conf.main, SPA_MIN(OPUS_05_GET_BITRATE(conf.main), max / 1024));
+		else
+			OPUS_05_SET_BITRATE(conf.main, max / 1024);
+
+		/* only 40 ms bidi frame appears to work OK */
+		if (conf.bidi.channels == 0)
+			true;
+		else if (conf.bidi.frame_duration & OPUS_05_FRAME_DURATION_400)
+			conf.bidi.frame_duration = OPUS_05_FRAME_DURATION_400;
+		else
+			return -EINVAL;
+
+		if (conf.bidi.channels == 0)
+			true;
+		else if (OPUS_05_GET_BITRATE(conf.bidi) != 0)
+			OPUS_05_SET_BITRATE(conf.bidi, SPA_MIN(OPUS_05_GET_BITRATE(conf.bidi), BITRATE_DUPLEX_BIDI / 1024));
+		else
+			OPUS_05_SET_BITRATE(conf.bidi, BITRATE_DUPLEX_BIDI / 1024);
+	}
 
 	memcpy(config, &conf, sizeof(conf));
 
@@ -506,6 +697,9 @@ static bool is_duplex_codec(const struct a2dp_codec *codec)
 
 static bool use_surround_encoder(const struct a2dp_codec *codec, bool is_sink)
 {
+	if (codec->id == SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO)
+		return false;
+
 	if (is_duplex_codec(codec))
 		return is_sink;
 	else
@@ -626,6 +820,27 @@ static int parse_frame_dms(int bitfield)
 	}
 }
 
+static void *codec_init_props(const struct a2dp_codec *codec, uint32_t flags, const struct spa_dict *settings)
+{
+	struct props *p;
+
+	if (codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO)
+		return NULL;
+
+	p = calloc(1, sizeof(struct props));
+	if (p == NULL)
+		return NULL;
+
+	parse_settings(p, settings);
+
+	return p;
+}
+
+static void codec_clear_props(void *props)
+{
+	free(props);
+}
+
 static void *codec_init(const struct a2dp_codec *codec, uint32_t flags,
 		void *config, size_t config_len, const struct spa_audio_info *info,
 		void *props, size_t mtu)
@@ -667,6 +882,12 @@ static void *codec_init(const struct a2dp_codec *codec, uint32_t flags,
 	this->samplerate = info->info.raw.rate;
 	this->channels = config_info.info.raw.channels;
 	this->application = OPUS_APPLICATION_AUDIO;
+
+	if (codec->id == SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO && props) {
+		struct props *p = props;
+		this->application = !this->is_bidi ? p->application :
+			p->bidi_application;
+	}
 
 	/*
 	 * Setup encoder
@@ -712,11 +933,17 @@ static void *codec_init(const struct a2dp_codec *codec, uint32_t flags,
 	}
 
 	if (!this->is_bidi) {
-		this->e.bitrate_max = SPA_MIN(BITRATE_MAX, OPUS_05_GET_BITRATE(*dir) * 1024);
+		if (codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO)
+			this->e.bitrate_max = SPA_MIN(BITRATE_MAX, OPUS_05_GET_BITRATE(*dir) * 1024);
+		else
+			this->e.bitrate_max = OPUS_05_GET_BITRATE(*dir) * 1024;
 		this->e.bitrate_min = SPA_MIN(BITRATE_MIN, this->e.bitrate_max);
 		this->e.bitrate = SPA_CLAMP(BITRATE_DEFAULT, this->e.bitrate_min, this->e.bitrate_max);
 	} else {
-		this->e.bitrate_max = SPA_MIN(BITRATE_DUPLEX_BIDI, OPUS_05_GET_BITRATE(*dir) * 1024);
+		if (codec->id != SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO)
+			this->e.bitrate_max = SPA_MIN(BITRATE_DUPLEX_BIDI, OPUS_05_GET_BITRATE(*dir) * 1024);
+		else
+			this->e.bitrate_max = OPUS_05_GET_BITRATE(*dir) * 1024;
 		this->e.bitrate_min = SPA_MIN(BITRATE_MIN, this->e.bitrate_max);
 		this->e.bitrate = SPA_CLAMP(BITRATE_DUPLEX_BIDI, this->e.bitrate_min, this->e.bitrate_max);
 	}
@@ -1113,10 +1340,21 @@ const struct a2dp_codec a2dp_codec_opus_05_duplex = {
 	.duplex_codec = &a2dp_codec_opus_05_return,
 };
 
+const struct a2dp_codec a2dp_codec_opus_05_pro = {
+	OPUS_05_COMMON_DEFS,
+	.id = SPA_BLUETOOTH_AUDIO_CODEC_OPUS_05_PRO,
+	.name = "opus_05_pro",
+	.description = "Opus Pro Audio",
+	.init_props = codec_init_props,
+	.clear_props = codec_clear_props,
+	.duplex_codec = &a2dp_codec_opus_05_return,
+};
+
 A2DP_CODEC_EXPORT_DEF(
 	"opus",
 	&a2dp_codec_opus_05,
 	&a2dp_codec_opus_05_51,
 	&a2dp_codec_opus_05_71,
-	&a2dp_codec_opus_05_duplex
+	&a2dp_codec_opus_05_duplex,
+	&a2dp_codec_opus_05_pro
 );
