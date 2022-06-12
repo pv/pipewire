@@ -562,6 +562,9 @@ static void a2dp_on_ready_read(struct spa_source *source)
 	port->ready_offset += avail;
 	this->sample_count += decoded / port->frame_size;
 
+	if (this->following)
+		return;
+
 	/* send buffer if full */
 	min_data = SPA_MIN(this->props.min_latency * port->frame_size, datas[0].maxsize / 2);
 	if (port->ready_offset >= min_data) {
@@ -589,9 +592,6 @@ static void a2dp_on_ready_read(struct spa_source *source)
 
 	/* done if there are no buffers ready */
 	if (spa_list_is_empty(&port->ready))
-		return;
-
-	if (this->following)
 		return;
 
 	/* process the buffer if IO does not have any */
@@ -1271,6 +1271,21 @@ static int impl_node_process(void *object)
 	if (io->buffer_id < port->n_buffers) {
 		recycle_buffer(this, port, io->buffer_id);
 		io->buffer_id = SPA_ID_INVALID;
+	}
+
+	/* If follower, send buffer */
+	if (this->following && port->current_buffer && port->ready_offset > 0) {
+		struct spa_data *datas;
+
+		buffer = port->current_buffer;
+		datas = buffer->buf->datas;
+		datas[0].chunk->offset = 0;
+		datas[0].chunk->size = port->ready_offset;
+		datas[0].chunk->stride = port->frame_size;
+
+		spa_log_trace(this->log, "queue %d", buffer->id);
+		spa_list_append(&port->ready, &buffer->link);
+		port->current_buffer = NULL;
 	}
 
 	/* Return if there are no buffers ready to be processed */
