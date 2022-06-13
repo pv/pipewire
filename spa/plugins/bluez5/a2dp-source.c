@@ -73,6 +73,8 @@ struct props {
 #define MIN_LATENCY	512
 #define MAX_LATENCY	1024
 
+#define BUFFERING_UPDATE_SEC	6
+
 struct buffer {
 	uint32_t id;
 	unsigned int outstanding:1;
@@ -89,6 +91,7 @@ struct port {
 	uint64_t info_all;
 	struct spa_port_info info;
 	struct spa_io_buffers *io;
+	struct spa_io_rate_match *rate_match;
 	struct spa_latency_info latency;
 #define IDX_EnumFormat	0
 #define IDX_Meta	1
@@ -107,6 +110,11 @@ struct port {
 
 	struct buffer *current_buffer;
 	uint32_t ready_offset;
+
+	uint32_t buffering;
+	uint32_t min_buffered;
+	uint32_t max_buffered;
+	uint32_t buffering_counter;
 };
 
 struct impl {
@@ -145,8 +153,14 @@ struct impl {
 	int fd;
 	struct spa_source source;
 
+	struct spa_source timer_source;
+	int timerfd;
+
 	struct spa_io_clock *clock;
         struct spa_io_position *position;
+
+	uint64_t current_time;
+	uint64_t next_time;
 
 	const struct a2dp_codec *codec;
 	bool codec_props_changed;
@@ -158,7 +172,6 @@ struct impl {
 	uint8_t buffer_decoded[65536];
 	struct timespec now;
 	uint64_t sample_count;
-	uint64_t skip_count;
 
 	uint64_t timestamp;
 	uint64_t seqnum;
@@ -271,6 +284,27 @@ static int impl_node_enum_params(void *object, int seq,
 	return 0;
 }
 
+static int set_timeout(struct impl *this, uint64_t time)
+{
+	struct itimerspec ts;
+	ts.it_value.tv_sec = time / SPA_NSEC_PER_SEC;
+	ts.it_value.tv_nsec = time % SPA_NSEC_PER_SEC;
+	ts.it_interval.tv_sec = 0;
+	ts.it_interval.tv_nsec = 0;
+	return spa_system_timerfd_settime(this->data_system,
+			this->timerfd, SPA_FD_TIMER_ABSTIME, &ts, NULL);
+}
+
+static int set_timers(struct impl *this)
+{
+	struct timespec now;
+
+	spa_system_clock_gettime(this->data_system, CLOCK_MONOTONIC, &now);
+	this->next_time = SPA_TIMESPEC_TO_NSEC(&now);
+
+	return set_timeout(this, this->following ? 0 : this->next_time);
+}
+
 static int do_reassing_follower(struct spa_loop *loop,
 			bool async,
 			uint32_t seq,
@@ -278,6 +312,9 @@ static int do_reassing_follower(struct spa_loop *loop,
 			size_t size,
 			void *user_data)
 {
+	struct impl *this = user_data;
+	if (this->sample_count > 0)
+		set_timers(this);
 	return 0;
 }
 
@@ -474,32 +511,34 @@ static int32_t decode_data(struct impl *this, uint8_t *src, uint32_t src_size,
 	return dst_size - avail;
 }
 
-static void skip_ready_buffers(struct impl *this)
+static uint32_t get_data_size(struct impl *this)
 {
 	struct port *port = &this->port;
+	uint32_t size;
 
-	/* Move all buffers from ready to free */
-	while (!spa_list_is_empty(&port->ready)) {
-		struct buffer *b;
-		b = spa_list_first(&port->ready, struct buffer, link);
-		spa_list_remove(&b->link);
-		spa_list_append(&port->free, &b->link);
-		spa_assert(!b->outstanding);
-		this->skip_count += b->buf->datas[0].chunk->size / port->frame_size;
+	if (SPA_LIKELY(port->rate_match) && SPA_FLAG_IS_SET(port->rate_match->flags, SPA_IO_RATE_MATCH_FLAG_ACTIVE)) {
+		size = port->rate_match->size * port->frame_size;
+	} else {
+		if (SPA_LIKELY(this->position))
+			size = this->position->clock.duration * this->clock->rate.denom / port->current_format.info.raw.rate;
+		else
+			size = 1024;
+		size *= port->frame_size;
 	}
+	return size;
 }
 
 static void a2dp_on_ready_read(struct spa_source *source)
 {
 	struct impl *this = source->data;
 	struct port *port = &this->port;
-	struct spa_io_buffers *io = port->io;
 	int32_t size_read, decoded, avail;
 	struct spa_data *datas;
 	struct buffer *buffer;
 	uint32_t dtimestamp;
 	uint16_t dseqnum;
 	uint32_t min_data;
+	void *buffer_pos;
 
 	/* make sure the source is an input */
 	if ((source->rmask & SPA_IO_IN) == 0) {
@@ -543,6 +582,11 @@ static void a2dp_on_ready_read(struct spa_source *source)
 	if (decoded == 0)
 		return;
 
+	if (this->sample_count == 0)
+		set_timers(this);
+
+	this->sample_count += decoded / port->frame_size;
+
 	spa_log_trace(this->log, "decoded socket data size:%d timestamp:%"PRIu64" seqnum:%"PRIu64,
 			(int)decoded, this->timestamp, this->seqnum);
 
@@ -550,95 +594,51 @@ static void a2dp_on_ready_read(struct spa_source *source)
 	if (!this->started)
 		return;
 
-	/* get buffer */
-	if (!port->current_buffer) {
-		if (spa_list_is_empty(&port->free)) {
-			/* xrun, skip ahead */
-			skip_ready_buffers(this);
-			this->skip_count += decoded / port->frame_size;
-			this->sample_count += decoded / port->frame_size;
-			return;
+	min_data = get_data_size(this);
+
+	/* copy data to buffers */
+	buffer_pos = this->buffer_decoded;
+	while (!spa_list_is_empty(&port->free) && decoded > 0) {
+		if (!port->current_buffer) {
+			buffer = spa_list_first(&port->free, struct buffer, link);
+			spa_list_remove(&buffer->link);
+
+			port->current_buffer = buffer;
+			port->ready_offset = 0;
+			spa_log_trace(this->log, "dequeue %d", buffer->id);
+
+			if (buffer->h) {
+				buffer->h->seq = this->sample_count;
+				buffer->h->pts = SPA_TIMESPEC_TO_NSEC(&this->now);
+				buffer->h->dts_offset = 0;
+			}
+		} else {
+			buffer = port->current_buffer;
 		}
-		if (this->skip_count > 0) {
-			spa_log_info(this->log, "%p: xrun, skipped %"PRIu64" usec",
-			             this, (uint64_t)(this->skip_count * SPA_USEC_PER_SEC / port->current_format.info.raw.rate));
-			this->skip_count = 0;
-		}
+		datas = buffer->buf->datas;
 
-		buffer = spa_list_first(&port->free, struct buffer, link);
-		spa_list_remove(&buffer->link);
+		/* copy data into buffer */
+		avail = SPA_MIN(min_data, SPA_MIN((uint32_t)decoded, (uint32_t)(datas[0].maxsize - port->ready_offset)));
+		memcpy ((uint8_t *)datas[0].data + port->ready_offset, buffer_pos, avail);
+		port->ready_offset += avail;
 
-		port->current_buffer = buffer;
-		port->ready_offset = 0;
-		spa_log_trace(this->log, "dequeue %d", buffer->id);
+		decoded -= avail;
+		buffer_pos = SPA_PTROFF(buffer_pos, avail, void);
 
-		if (buffer->h) {
-			buffer->h->seq = this->sample_count;
-			buffer->h->pts = SPA_TIMESPEC_TO_NSEC(&this->now);
-			buffer->h->dts_offset = 0;
-		}
-	} else {
-		buffer = port->current_buffer;
-	}
-	datas = buffer->buf->datas;
+		/* ready buffer if full */
+		if (port->ready_offset >= min_data) {
+			datas[0].chunk->offset = 0;
+			datas[0].chunk->size = port->ready_offset;
+			datas[0].chunk->stride = port->frame_size;
 
-	/* copy data into buffer */
-	avail = SPA_MIN(decoded, (int32_t)(datas[0].maxsize - port->ready_offset));
-	if (avail < decoded)
-		spa_log_warn(this->log, "buffer too small (%d > %d)", decoded, avail);
-	memcpy ((uint8_t *)datas[0].data + port->ready_offset, this->buffer_decoded, avail);
-	port->ready_offset += avail;
-	this->sample_count += decoded / port->frame_size;
-
-	if (this->following)
-		return;
-
-	/* send buffer if full */
-	min_data = SPA_MIN(this->props.min_latency * port->frame_size, datas[0].maxsize / 2);
-	if (port->ready_offset >= min_data) {
-		uint64_t sample_count;
-
-		datas[0].chunk->offset = 0;
-		datas[0].chunk->size = port->ready_offset;
-		datas[0].chunk->stride = port->frame_size;
-
-		sample_count = datas[0].chunk->size / port->frame_size;
-
-		spa_log_trace(this->log, "queue %d", buffer->id);
-		spa_list_append(&port->ready, &buffer->link);
-		port->current_buffer = NULL;
-
-		if (!this->following && this->clock) {
-			this->clock->nsec = SPA_TIMESPEC_TO_NSEC(&this->now);
-			this->clock->duration = sample_count * this->clock->rate.denom / port->current_format.info.raw.rate;
-			this->clock->position = this->sample_count * this->clock->rate.denom / port->current_format.info.raw.rate;
-			this->clock->delay = 0;
-			this->clock->rate_diff = 1.0f;
-			this->clock->next_nsec = this->clock->nsec + (uint64_t)sample_count * SPA_NSEC_PER_SEC / port->current_format.info.raw.rate;
+			spa_log_trace(this->log, "queue %d frames:%d", buffer->id, port->ready_offset / port->frame_size);
+			spa_list_append(&port->ready, &buffer->link);
+			port->current_buffer = NULL;
+		} else {
+			spa_log_trace(this->log, "stash %d frames:%d", buffer->id, port->ready_offset / port->frame_size);
+			break;
 		}
 	}
-
-	/* done if there are no buffers ready */
-	if (spa_list_is_empty(&port->ready))
-		return;
-
-	/* process the buffer if IO does not have any */
-	if (io != NULL && io->status != SPA_STATUS_HAVE_DATA) {
-		struct buffer *b;
-
-		if (io->buffer_id < port->n_buffers)
-			recycle_buffer(this, port, io->buffer_id);
-
-		b = spa_list_first(&port->ready, struct buffer, link);
-		spa_list_remove(&b->link);
-		b->outstanding = true;
-
-		io->buffer_id = b->id;
-		io->status = SPA_STATUS_HAVE_DATA;
-	}
-
-	/* notify ready */
-	spa_node_call_ready(&this->callbacks, SPA_STATUS_HAVE_DATA);
 	return;
 
 stop:
@@ -668,6 +668,52 @@ static void a2dp_on_duplex_timeout(struct spa_source *source)
 	set_duplex_timeout(this, this->duplex_timeout);
 
 	a2dp_on_ready_read(source);
+}
+
+static void a2dp_on_timeout(struct spa_source *source)
+{
+	struct impl *this = source->data;
+	struct port *port = &this->port;
+	uint64_t exp, duration;
+	uint32_t rate;
+	struct spa_io_buffers *io = port->io;
+	uint64_t prev_time, now_time;
+
+	if (this->transport == NULL)
+		return;
+
+	if (this->started && spa_system_timerfd_read(this->data_system, this->timerfd, &exp) < 0)
+		spa_log_warn(this->log, "error reading timerfd: %s", strerror(errno));
+
+	prev_time = this->current_time;
+	now_time = this->current_time = this->next_time;
+
+	spa_log_debug(this->log, "%p: timeout %"PRIu64" %"PRIu64"", this,
+			now_time, now_time - prev_time);
+
+	if (SPA_LIKELY(this->position)) {
+		duration = this->position->clock.duration;
+		rate = this->position->clock.rate.denom;
+	} else {
+		duration = 1024;
+		rate = 48000;
+	}
+
+	this->next_time = now_time + duration * SPA_NSEC_PER_SEC / rate;
+
+	if (SPA_LIKELY(this->clock)) {
+		this->clock->nsec = now_time;
+		this->clock->position += duration;
+		this->clock->duration = duration;
+		this->clock->rate_diff = 1.0f;
+		this->clock->next_nsec = this->next_time;
+	}
+
+	spa_log_trace(this->log, "%p: %d", this, io->status);
+	io->status = SPA_STATUS_HAVE_DATA;
+	spa_node_call_ready(&this->callbacks, SPA_STATUS_HAVE_DATA);
+
+	set_timeout(this, this->next_time);
 }
 
 static int transport_start(struct impl *this)
@@ -747,8 +793,17 @@ static int transport_start(struct impl *this)
 		set_duplex_timeout(this, this->duplex_timeout);
 	}
 
+	this->timer_source.data = this;
+	this->timer_source.fd = this->timerfd;
+	this->timer_source.func = a2dp_on_timeout;
+	this->timer_source.mask = SPA_IO_IN;
+	this->timer_source.rmask = 0;
+	spa_loop_add_source(this->data_loop, &this->timer_source);
+
 	this->sample_count = 0;
-	this->skip_count = 0;
+
+	port->buffering = 2;
+	port->min_buffered = UINT32_MAX;
 
 	this->timestamp = 0;
 	this->seqnum = 0;
@@ -787,6 +842,7 @@ static int do_remove_source(struct spa_loop *loop,
 			    void *user_data)
 {
 	struct impl *this = user_data;
+	struct itimerspec ts;
 
 	spa_log_debug(this->log, "%p: remove source", this);
 
@@ -794,6 +850,14 @@ static int do_remove_source(struct spa_loop *loop,
 
 	if (this->source.loop)
 		spa_loop_remove_source(this->data_loop, &this->source);
+
+	if (this->timer_source.loop)
+		spa_loop_remove_source(this->data_loop, &this->timer_source);
+	ts.it_value.tv_sec = 0;
+	ts.it_value.tv_nsec = 0;
+	ts.it_interval.tv_sec = 0;
+	ts.it_interval.tv_nsec = 0;
+	spa_system_timerfd_settime(this->data_system, this->timerfd, 0, &ts, NULL);
 
 	return 0;
 }
@@ -876,7 +940,7 @@ static void emit_node_info(struct impl *this, bool full)
 	struct spa_dict_item node_info_items[] = {
 		{ SPA_KEY_DEVICE_API, "bluez5" },
 		{ SPA_KEY_MEDIA_CLASS, this->is_input ? "Audio/Source" : "Stream/Output/Audio" },
-		{ SPA_KEY_NODE_LATENCY, latency },
+		{ SPA_KEY_NODE_LATENCY, this->is_input ? "" : latency },
 		{ "media.name", ((this->transport && this->transport->device->name) ?
 		                 this->transport->device->name : "A2DP") },
                 { SPA_KEY_NODE_DRIVER, this->is_input ? "true" : "false" },
@@ -1026,7 +1090,7 @@ impl_node_port_enum_params(void *object, int seq,
 
 		param = spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_ParamBuffers, id,
-			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 8, MAX_BUFFERS),
+			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(16, 16, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(
 							this->props.max_latency * port->frame_size,
@@ -1055,6 +1119,12 @@ impl_node_port_enum_params(void *object, int seq,
 				SPA_TYPE_OBJECT_ParamIO, id,
 				SPA_PARAM_IO_id,   SPA_POD_Id(SPA_IO_Buffers),
 				SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_buffers)));
+			break;
+		case 1:
+			param = spa_pod_builder_add_object(&b,
+					SPA_TYPE_OBJECT_ParamIO, id,
+					SPA_PARAM_IO_id,   SPA_POD_Id(SPA_IO_RateMatch),
+					SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_rate_match)));
 			break;
 		default:
 			return 0;
@@ -1252,6 +1322,9 @@ impl_node_port_set_io(void *object,
 	case SPA_IO_Buffers:
 		port->io = data;
 		break;
+	case SPA_IO_RateMatch:
+		port->rate_match = data;
+		break;
 	default:
 		return -ENOENT;
 	}
@@ -1279,6 +1352,80 @@ static int impl_node_port_reuse_buffer(void *object, uint32_t port_id, uint32_t 
 	return 0;
 }
 
+static void process_buffering(struct impl *this)
+{
+	struct port *port = &this->port;
+	struct buffer *buffer;
+	struct spa_data *datas;
+	size_t avail;
+	size_t min_data;
+	uint32_t num_ready;
+	uint32_t buf_secs;
+
+	min_data = get_data_size(this);
+
+	num_ready = 0;
+	spa_list_for_each(buffer, &port->ready, link)
+		++num_ready;
+
+	port->min_buffered = SPA_MIN(num_ready, port->min_buffered);
+	port->max_buffered = SPA_MAX(num_ready, port->max_buffered);
+
+	/* Drop delayed buffers */
+	while (num_ready > port->buffering) {
+		buffer = spa_list_first(&port->ready, struct buffer, link);
+		spa_assert(!buffer->outstanding);
+		spa_list_remove(&buffer->link);
+		spa_list_append(&port->free, &buffer->link);
+		--num_ready;
+	}
+
+	/* Underrun: pad with silence */
+	if (num_ready == 0 && !spa_list_is_empty(&port->free)) {
+		port->max_buffered = SPA_MIN((uint32_t)MAX_BUFFERS, port->max_buffered + 1);
+		port->buffering = port->max_buffered;
+		port->buffering_counter = 0;
+
+		buffer = spa_list_first(&port->free, struct buffer, link);
+
+		spa_list_remove(&buffer->link);
+		datas = buffer->buf->datas;
+
+		avail = SPA_MIN(min_data, datas[0].maxsize);
+		memset(datas[0].data, 0, avail);
+
+		datas[0].chunk->offset = 0;
+		datas[0].chunk->size = avail;
+		datas[0].chunk->stride = port->frame_size;
+		spa_list_append(&port->ready, &buffer->link);
+	}
+
+	/* Tune buffering: try to keep exactly 1 buffer ready */
+	buf_secs = port->buffering_counter * min_data / (port->frame_size * port->current_format.info.raw.rate);
+	if (buf_secs >= BUFFERING_UPDATE_SEC) {
+		if (port->min_buffered == 0)
+			spa_log_debug(this->log, "%p underrun has occurred", this);
+		if (port->max_buffered > port->buffering)
+			spa_log_debug(this->log, "%p overrun has occurred", this);
+
+		/* At least 2: unlikely recv and timer schedules match exactly */
+		if (port->buffering > 2)
+			port->buffering = (port->buffering + (port->max_buffered - port->min_buffered + 2)) / 2;
+		else
+			port->buffering = 2;
+
+		spa_log_debug(this->log, "%p buffering:%d min-buffered:%d max-buffered:%d size:%d", this,
+				(int)port->buffering, (int)port->min_buffered, (int)port->max_buffered,
+				(int)min_data);
+
+		port->buffering_counter = 0;
+		port->min_buffered = UINT32_MAX;
+		port->max_buffered = 0;
+	} else {
+		++port->buffering_counter;
+	}
+}
+
 static int impl_node_process(void *object)
 {
 	struct impl *this = object;
@@ -1304,20 +1451,8 @@ static int impl_node_process(void *object)
 		io->buffer_id = SPA_ID_INVALID;
 	}
 
-	/* If follower, send buffer */
-	if (this->following && port->current_buffer && port->ready_offset > 0) {
-		struct spa_data *datas;
-
-		buffer = port->current_buffer;
-		datas = buffer->buf->datas;
-		datas[0].chunk->offset = 0;
-		datas[0].chunk->size = port->ready_offset;
-		datas[0].chunk->stride = port->frame_size;
-
-		spa_log_trace(this->log, "queue %d", buffer->id);
-		spa_list_append(&port->ready, &buffer->link);
-		port->current_buffer = NULL;
-	}
+	/* Handle buffering delay */
+	process_buffering(this);
 
 	/* Return if there are no buffers ready to be processed */
 	if (spa_list_is_empty(&port->ready))
@@ -1406,6 +1541,7 @@ static int impl_clear(struct spa_handle *handle)
 		this->codec->clear_props(this->codec_props);
 	if (this->transport)
 		spa_hook_remove(&this->transport_listener);
+	spa_system_close(this->data_system, this->timerfd);
 	if (this->duplex_timerfd >= 0) {
 		spa_system_close(this->data_system, this->duplex_timerfd);
 		this->duplex_timerfd = -1;
@@ -1537,6 +1673,9 @@ impl_init(const struct spa_handle_factory *factory,
 
 	spa_bt_transport_add_listener(this->transport,
 			&this->transport_listener, &transport_events, this);
+
+	this->timerfd = spa_system_timerfd_create(this->data_system,
+			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
 
 	if (this->use_duplex_source) {
 		this->duplex_timerfd = spa_system_timerfd_create(this->data_system,
