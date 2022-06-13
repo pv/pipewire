@@ -160,6 +160,9 @@ struct impl {
 	uint64_t sample_count;
 	uint64_t skip_count;
 
+	uint64_t timestamp;
+	uint64_t seqnum;
+
 	int duplex_timerfd;
 	uint64_t duplex_timeout;
 };
@@ -421,17 +424,38 @@ again:
 }
 
 static int32_t decode_data(struct impl *this, uint8_t *src, uint32_t src_size,
-			   uint8_t *dst, uint32_t dst_size)
+		uint8_t *dst, uint32_t dst_size, uint16_t *dseqnum, uint32_t *dtimestamp)
 {
+	const uint64_t mask16 = 0xffff;
+	const uint64_t mask32 = 0xffffffff;
 	ssize_t processed;
 	size_t written, avail;
+	uint16_t seqnum;
+	uint32_t timestamp;
+	uint64_t timestamp_unwrap;
+	uint32_t seqnum_unwrap;
 
 	if ((processed = this->codec->start_decode(this->codec_data,
-				src, src_size, NULL, NULL)) < 0)
+				src, src_size, &seqnum, &timestamp)) < 0)
 		return processed;
 
 	src += processed;
 	src_size -= processed;
+
+	/* unwrap rtp header time/sequence stamps */
+	timestamp_unwrap = (this->timestamp & ~mask32) | timestamp;
+	if (timestamp < (this->timestamp & mask32))
+		timestamp_unwrap += ((uint64_t)1 << 32);
+
+	seqnum_unwrap = (this->seqnum & ~mask16) | seqnum;
+	if (seqnum < (this->seqnum & mask16))
+		seqnum_unwrap += ((uint64_t)1 << 16);
+
+	*dtimestamp = timestamp_unwrap - this->timestamp;
+	*dseqnum = seqnum_unwrap - this->seqnum;
+
+	this->timestamp = timestamp_unwrap;
+	this->seqnum = seqnum_unwrap;
 
 	/* decode */
 	avail = dst_size;
@@ -473,6 +497,8 @@ static void a2dp_on_ready_read(struct spa_source *source)
 	int32_t size_read, decoded, avail;
 	struct spa_data *datas;
 	struct buffer *buffer;
+	uint32_t dtimestamp;
+	uint16_t dseqnum;
 	uint32_t min_data;
 
 	/* make sure the source is an input */
@@ -508,7 +534,8 @@ static void a2dp_on_ready_read(struct spa_source *source)
 
 	/* decode */
 	decoded = decode_data(this, this->buffer_read, size_read,
-			this->buffer_decoded, sizeof (this->buffer_decoded));
+			this->buffer_decoded, sizeof (this->buffer_decoded),
+			&dseqnum, &dtimestamp);
 	if (decoded < 0) {
 		spa_log_debug(this->log, "failed to decode data: %d", decoded);
 		return;
@@ -516,7 +543,8 @@ static void a2dp_on_ready_read(struct spa_source *source)
 	if (decoded == 0)
 		return;
 
-	spa_log_trace(this->log, "decoded socket data %d", decoded);
+	spa_log_trace(this->log, "decoded socket data size:%d timestamp:%"PRIu64" seqnum:%"PRIu64,
+			(int)decoded, this->timestamp, this->seqnum);
 
 	/* discard when not started */
 	if (!this->started)
@@ -721,6 +749,9 @@ static int transport_start(struct impl *this)
 
 	this->sample_count = 0;
 	this->skip_count = 0;
+
+	this->timestamp = 0;
+	this->seqnum = 0;
 
 	return 0;
 }
